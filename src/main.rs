@@ -1,22 +1,23 @@
 use clap::{Parser, Subcommand};
+use crossbeam_channel::unbounded;
 use fs_extra::file::CopyOptions;
 use std::fs;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use walkdir::{DirEntry, WalkDir};
-use threadpool::ThreadPool;
-use crossbeam_channel::unbounded;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use threadpool::ThreadPool;
+use walkdir::{DirEntry, WalkDir};
 
-/// Simple program to greet a person
+/// Simple del or trim file option.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Name of the person to greet
+    /// Path of the option.
     #[arg(short = 'p', long)]
     path: String,
 
+    /// del or trim of subcommand.
     #[command(subcommand)]
     command: Commands,
 }
@@ -32,14 +33,13 @@ enum Commands {
 fn main() {
     let args = Args::parse();
 
-    println!("args:{:#?}", args);
-    println!("Hello {}!", args.path);
+    // println!("args:{:#?}", args);
 
-    let trash_path = Path::new(&args.path).join("trash");
+    let trash_path: Arc<PathBuf> = Arc::new(Path::new(&args.path).join("trash"));
     // create trash dire
     if !trash_path.exists() {
         println!("not exist {} and create it.", trash_path.display());
-        fs_extra::dir::create(&trash_path, false).unwrap();
+        fs_extra::dir::create(&*trash_path, false).unwrap();
     } else {
         println!("{} is exist.", trash_path.display());
     }
@@ -60,15 +60,13 @@ fn main() {
 
     let pool = ThreadPool::new(num_cpus::get());
     let (sender, receiver) = unbounded();
-    let total_files= Arc::new(AtomicU64::new(0));
-    let total_rename_files = Arc::new(AtomicU64::new(0));
+    let total_files = Arc::new(AtomicU64::new(0));
+    let total_success_files = Arc::new(AtomicU64::new(0));
     let start = Instant::now();
 
-
     match &args.command {
+        // 删除重复的文件
         Commands::Del => {
-            let options = CopyOptions::new(); //Initialize default values for CopyOptions
-
             for entry in WalkDir::new(&args.path) {
                 if entry.is_err() {
                     continue;
@@ -92,26 +90,35 @@ fn main() {
                     continue;
                 }
 
-                if is_delete_file(&entry) {
-                    // println!("delete: {}", entry.path().display());
-                    let path = trash_path.clone().join(entry.file_name());
-                    println!("from:{}\n\t to:{}", entry.path().display(), path.display());
-                    fs_extra::file::move_file(entry.path(), path, &options).expect("error move");
-                }
+                let entry = entry.clone();
+                let sender = sender.clone();
+                let total_files = Arc::clone(&total_files);
+                let total_success_files = Arc::clone(&total_success_files);
+                let trash_path = Arc::clone(&trash_path);
+                pool.execute(move || {
+                    total_files.fetch_add(1, Ordering::Relaxed); // 总文件计数
+                    if is_delete_file(&entry) {
+                        let to = trash_path.join(entry.file_name());
+                        fs_extra::file::move_file(entry.path(), to, &CopyOptions::new())
+                            .expect("error move");
+                        sender
+                            .send(entry.file_name().to_str().unwrap().to_string())
+                            .expect("could not send data.");
+                        total_success_files.fetch_add(1, Ordering::Relaxed); // 成功执行的文件
+                    }
+                });
             }
         }
 
         Commands::Trim { vchar } => {
             if vchar.is_some() {
                 let vchar = vchar.as_ref().unwrap().clone();
-                default_trims.lock().unwrap().insert(0, vchar.clone());
-                // (*default_trims).insert(0, vchar.clone());
-                println!("vchar: {}, default_trims:{:?}", vchar, default_trims);
+                default_trims.lock().unwrap().insert(0, vchar.clone()); // 将手动加入的放在第一个位置
             }
             // 轮询目录
             for entry in WalkDir::new(&args.path) {
                 if entry.is_err() {
-                    continue
+                    continue;
                 }
 
                 let entry = entry.unwrap();
@@ -120,7 +127,7 @@ fn main() {
                 let sender = sender.clone();
                 let default_trims = Arc::clone(&default_trims);
                 let total_files = Arc::clone(&total_files);
-                let total_rename_files = Arc::clone(&total_rename_files);
+                let total_success_files = Arc::clone(&total_success_files);
                 pool.execute(move || {
                     if entry.path_is_symlink() {
                         return;
@@ -141,9 +148,11 @@ fn main() {
                     total_files.fetch_add(1, Ordering::Relaxed);
                     for v in &*default_trims.lock().unwrap() {
                         if rename_file(&entry, v) {
-                            sender.send(entry.path().display().to_string()).expect("could not send data.");
-                            total_rename_files.fetch_add(1, Ordering::Relaxed);
-                            break;
+                            sender
+                                .send(entry.file_name().to_str().unwrap().to_string())
+                                .expect("could not send data.");
+                            total_success_files.fetch_add(1, Ordering::Relaxed);
+                            break; // 只要匹配到一个就可以 break 出来
                         }
                     }
                 });
@@ -154,10 +163,16 @@ fn main() {
     drop(sender);
 
     for t in receiver.iter() {
-        println!("rename:{}", t);
+        println!("success options:{}", t);
     }
 
-    println!("use:{} threads, total:{}, rename:{}, elapsed:{:?}", num_cpus::get(), total_files.load(Ordering::Relaxed), total_rename_files.load(Ordering::Relaxed), start.elapsed());
+    println!(
+        "use:{} threads, total:{}, success:{}, elapsed:{:?}",
+        num_cpus::get(),
+        total_files.load(Ordering::Relaxed),
+        total_success_files.load(Ordering::Relaxed),
+        start.elapsed()
+    );
 }
 
 fn rename_file(entry: &DirEntry, vchar: &str) -> bool {
