@@ -2,7 +2,12 @@ use clap::{Parser, Subcommand};
 use fs_extra::file::CopyOptions;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use walkdir::{DirEntry, WalkDir};
+use threadpool::ThreadPool;
+use crossbeam_channel::unbounded;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -39,20 +44,26 @@ fn main() {
         println!("{} is exist.", trash_path.display());
     }
 
-    let default_trims = vec![
-        r#"海量资源尽在：666java.com【海量资源： www.666java.com】"#,
-        r#"【更多资源访问：  666java.com】"#,
-        r#"【666资源站：666 java.com】"#,
-        r#"【海量资源：666java.com】"#,
-        r#"【海量一手：666java .com】"#,
-        r#"【海量一手：666java.com】"#,
-        r#"【666资源站：666java.com】"#,
-        r#"海量资源尽在：666java.com"#,
-        r#"海量资源：666java.com"#,
-        r#"更多资源： www.666java.com"#,
-    ];
+    let default_trims: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![
+        String::from(r#"海量资源尽在：666java.com【海量资源： www.666java.com】"#),
+        String::from(r#"【更多资源访问：  666java.com】"#),
+        String::from(r#"【666资源站：666 java.com】"#),
+        String::from(r#"【海量资源：666java.com】"#),
+        String::from(r#"【海量一手：666java .com】"#),
+        String::from(r#"【海量一手：666java.com】"#),
+        String::from(r#"【666资源站：666java.com】"#),
+        String::from(r#"海量资源尽在：666java.com"#),
+        String::from(r#"海量资源：666java.com"#),
+        String::from(r#"更多资源： www.666java.com"#),
+        String::from(r#"【IT视频学习网-www.itspxx.com】"#),
+    ]));
 
-    let (s, r) = crossbeam_channel::bounded(0);
+    let pool = ThreadPool::new(num_cpus::get());
+    let (sender, receiver) = unbounded();
+    let total_files= Arc::new(AtomicU64::new(0));
+    let total_rename_files = Arc::new(AtomicU64::new(0));
+    let start = Instant::now();
+
 
     match &args.command {
         Commands::Del => {
@@ -91,42 +102,62 @@ fn main() {
         }
 
         Commands::Trim { vchar } => {
+            if vchar.is_some() {
+                let vchar = vchar.as_ref().unwrap().clone();
+                default_trims.lock().unwrap().insert(0, vchar.clone());
+                // (*default_trims).insert(0, vchar.clone());
+                println!("vchar: {}, default_trims:{:?}", vchar, default_trims);
+            }
+            // 轮询目录
             for entry in WalkDir::new(&args.path) {
                 if entry.is_err() {
-                    continue;
+                    continue
                 }
 
                 let entry = entry.unwrap();
 
-                if entry.path_is_symlink() {
-                    continue;
-                }
+                let entry = entry.clone();
+                let sender = sender.clone();
+                let default_trims = Arc::clone(&default_trims);
+                let total_files = Arc::clone(&total_files);
+                let total_rename_files = Arc::clone(&total_rename_files);
+                pool.execute(move || {
+                    if entry.path_is_symlink() {
+                        return;
+                    }
 
-                if is_hidden(&entry) {
-                    continue;
-                }
+                    if is_hidden(&entry) {
+                        return;
+                    }
 
-                if entry.path().display().to_string().contains("/trash") {
-                    continue;
-                }
+                    if entry.path().display().to_string().contains("/trash") {
+                        return;
+                    }
 
-                if Path::new(entry.path()).is_dir() {
-                    continue;
-                }
+                    if Path::new(entry.path()).is_dir() {
+                        return;
+                    }
 
-                if vchar.is_some() {
-                    let vchar = vchar.clone().unwrap();
-                    rename_file(&entry, &vchar);
-                } else {
-                    for v in &default_trims {
+                    total_files.fetch_add(1, Ordering::Relaxed);
+                    for v in &*default_trims.lock().unwrap() {
                         if rename_file(&entry, v) {
+                            sender.send(entry.path().display().to_string()).expect("could not send data.");
+                            total_rename_files.fetch_add(1, Ordering::Relaxed);
                             break;
                         }
                     }
-                }
+                });
             }
         }
     }
+
+    drop(sender);
+
+    for t in receiver.iter() {
+        println!("rename:{}", t);
+    }
+
+    println!("use:{} threads, total:{}, rename:{}, elapsed:{:?}", num_cpus::get(), total_files.load(Ordering::Relaxed), total_rename_files.load(Ordering::Relaxed), start.elapsed());
 }
 
 fn rename_file(entry: &DirEntry, vchar: &str) -> bool {
@@ -173,6 +204,7 @@ mod tests {
     use super::*;
     use std::println;
 
+    // cargo test -- --nocapture -- this_test_rename_will_pass
     #[test]
     fn this_test_rename_will_pass() {
         let from = String::from("[2.4]--2-4基于Phoenix的RBAC权限模型【海量资源：666java.com】.mp4");
